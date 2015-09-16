@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pyenv/
+.pyenv2/
+.settings/
+.project
+.pydevproject
