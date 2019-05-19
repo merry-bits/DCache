@@ -1,38 +1,33 @@
 # Distributed redundant cache
 
-A distributed cache with a REST API, written in Python using ZeroMQ.
+A distributed cache written in Python using ZeroMQ. It allows to either set or
+get a key and its value. Both are strings. An empty value can not be stored.
+Storing an empty value deletes the entry instead.
+
 The cache consists of server nodes which communicate with each other and
-distribute the cache keys between them. The system has redundancy, meaning each
-key is stored on more than one server (default 3). A Python client for the
-API is provided as well.
+distribute the cache keys between them. When a node leaves the cache cluster not
+all keys from the leaving node are lost. Each node can answer any query and will
+forward a request to other nodes as necessary.
 
 
 ## Installation
 
 Create a Python 3 virtual environment or use an existing one and in the project
-folder run:
+folder run the following command to install the required python packages:
 ```bash
     $ pip install -r requirements.txt
 ```
 
+Once the requirements are fulfilled the server and client scripts can be used.
 
-## For running a load test with Locust
-
-Create a virtual or prepare an existing Python 2 environment and install
-[Locust](http://locust.io/):
-```bash
-    $ pip install locustio
-```
+No setup or other package support exists at this time.
 
 
 ## Run
 
-Both the node and the command line client need a Python 3 environment and use
+Both the server and the command line client need a Python 3 environment and use
 their set of parameters. Both accept `--help` and will show what is available
 or needed.
-
-The test run uses locustio to simulate client requests. This needs a Python 2
-environment.
 
 
 ### Node
@@ -40,18 +35,18 @@ environment.
 Run a node with:
 ```
     $ cd server/src
-    $ ./run.py
+    $ ./run.py <REQUEST ADDRESS> <PUBLICATION ADDRESS> <API ADDRESS>
 ```
 
-Each node needs two ZeroMQ socket address descriptors (the likes of
+Each node needs three ZeroMQ socket address descriptors (the likes of
 `tcp://127.0.0.1:8000`):
 - `request`: get/set cache commands and connect a new node to existing ones 
-- `service`: nodes making sure who is still running/reachable
-In addition each node runs a HTTP service on `0.0.0.0` at the given API port.
+- `publication`: nodes checking who is still running/reachable
+- `api`: get/set client requests
 
 If a new node needs to be connected to an existing cluster it needs a ZeroMQ
-socket address in the `--node` parameter pointing to the request socket of
-another running node from that cluster.
+socket address with the `--node` parameter pointing to the request socket of
+another running node.
 
 
 ## Client
@@ -62,39 +57,15 @@ Set or get a key with:
     $ ./run.py
 ```
 
-## Load test
-
-Start at least one node, remember the selected API port, then in the Python 2
-environment run:
-```
-    $ locust -f client/test/rest_clients.py --host http://localhost:<API port>
-```
-Now a locust test page is running at `http://localhost:8089` where you can
-start and stop clients setting and reading random keys.
+Alternatively import the `Cache` class from dcache_client and use the provided
+functions.  
 
 
-## Keys test
-
-Start at least one node, then:
-```
-    $ cd client/test
-    $ PYTHONPATH="../src" ./broken_node.py <URL>
-```
-The URL parameter should point to the API service of a running node. Something
-like `http://localhost:<API port>/dcache`.
-
-In theory this should add 1000 random keys, read and compare them, but at
-present it fails randomly if more than one node run as a cluster.
-
-
-# Solution
+# Implementation
 
 - the distribution of the keys is based on the blog entry
-[Consistent hashing](http://michaelnielsen.org/blog/consistent-hashing/)
+[Consistent hashing](http://michaelnielsen.org/blog/consistent-hashing/).
 - it is possible to add or remove one node at a time during runtime
-- on start up a new node needs to know only one other node to join
-- ZeroMQ is used for communication
-- each node provides the same API to the outside world
 
 
 ## Server detection
@@ -106,43 +77,70 @@ not seen by at least one node within a certain amount of time each node starts
 to remove that node from the list.
 
 
+### Publication protocol
+
+```
+publication = S:(node-topic *node)
+node-topic = "n"
+node = node-id request-address publication-address last-seen
+last-seen = YEAR : MONTH : DAY : HOUR : MINUTES : SECONDS ; UTC, Unix time
+```
+
+
 ## Key distribution
 
 According to the blog entry each node owns several indices (between 0 and 1),
-based on the nodes ID. This indices are calculated by each node for all other
-nodes and in that way each node knows to which node a key belongs.
+based on the node ID. This indices are calculated by each node for all other
+nodes and in that way each node knows to which node a key belongs. How often
+each node is present on the distribution circle is configured by `REPLICAS`.
+It is possible to use more than one circle so that the same key may be stored on
+different nodes. The amount of circles is configured with `REDUNDANCY`. (both
+to be found in [nodes.py](server/src/dcache/nodes.py))
 
 
-## Redundancy
+### Request protocol
 
-Each key is stored on three different nodes. This is achieved by making the IDs
-of the nodes sortable and giving each node the keys for the next two following
-nodes to store, as well as their own keys.
+```
+request = *(set / get / connect-to-cluster)
+set = \
+    C:(ids "" version "set" KEY VALUE timestamp)
+    S:(ids "" (version-not-supported / unknown-request / too-big / no-error))
+get = \
+    C:(ids "" version "get" KEY)
+    S:(ids "" \
+        (version-not-supported / unknown-request / (no-error VALUE timestamp))
+connect-to-cluster = \
+    C:(ids "" version "connect" NODE-ID REQUEST-ADDRESS PUBLISH-ADDRESS) \
+    S:(ids "" \
+        (version-not-supported / unknown-request / node-id-taken / \
+            (no-error SERVER-NODE-ID SERVER-REQUEST-ADDRESS \
+                SERVER-PUBLISH-ADDRESS
+            )
+        )
+    )
+ids = *ID ; zero or more ids, identifying a client request
+version = "1"
+no-error = "0" ; operation was successful
+too-big = "1" ; the key and value pair is bigger than the cache size
+node-id-taken = "997"
+unknown-request = "998"
+version-not-supported = "999"
+timestamp = YEAR : MONTH : DAY : HOUR : MINUTES : SECONDS ; UTC, Unix time
+```
 
 
-## Adding/removing a node
+### API protocol
 
-When a node is started up it registers itself to the existing node, subscribes
-to thats node service URL and shortly receives the list of all other nodes, too. 
-
-When one node is not seen for a certain amount of time each other node will
-remove that node from the list of known nodes.
-
-
-## Limitations
-
-- the nodes are assumed to be in the same time zone
-- a winter/summer time change would cause the cache to misbehave 
-- the system is not bug free:
-    - timeouts when getting/setting keys (broken node test)
-    - not all keys are copied to their redundancy nodes (rest clients test)
-
-
-# Files
-
-- client/src: the Python client to the cache
-- client/test: integration tests
-- server/src: the code for a cache node
-- requirements.txt: PIP requirements for the server and client (tests have
-their own requirements!)
-- README.md: this file
+```
+api = *(set / get)
+set = C:(ids "" version "set" KEY VALUE) S: (ids "" set-error)
+get = C:(ids "" version "get" KEY) S: (ids "" get-error VALUE)
+ids = *ID ; zero or more ids, identifying a client request
+version = "1"
+set-error = no-error / version-not-supported / too-big / timeout
+get-error = no-error / version-not-supported
+no-error = "0" ; operation was successful
+too-big = "-1" ; the key and value pair is bigger than the cache size
+timeout = "-2" ; at least one copy of the key was not stored as intended
+version-not-supported = "-999"
+```

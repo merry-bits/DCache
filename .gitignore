@@ -1,7 +1,10 @@
 __pycache__/
+.pytest_cache/
 *.py[cod]
+venv/
 .pyenv/
 .pyenv2/
 .settings/
+.idea/
 .project
 .pydevproject
