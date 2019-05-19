@@ -133,14 +133,19 @@ timestamp = YEAR : MONTH : DAY : HOUR : MINUTES : SECONDS ; UTC, Unix time
 
 ```
 api = *(set / get)
-set = C:(ids "" version "set" KEY VALUE) S: (ids "" set-error)
-get = C:(ids "" version "get" KEY) S: (ids "" get-error VALUE)
+set = \
+    C:(ids "" version "set" KEY VALUE) \
+    S:(ids "" \
+        (no-error / version-not-supported / unknown-request / too-big / \
+            timeout))
+get = \
+    C:(ids "" version "get" KEY) \
+    S:(ids "" (version-not-supported / unknown-request) / (no-error VALUE))
 ids = *ID ; zero or more ids, identifying a client request
 version = "1"
-set-error = no-error / version-not-supported / too-big / timeout
-get-error = no-error / version-not-supported
 no-error = "0" ; operation was successful
-too-big = "-1" ; the key and value pair is bigger than the cache size
-timeout = "-2" ; at least one copy of the key was not stored as intended
-version-not-supported = "-999"
+too-big = "1" ; the key and value pair is bigger than the cache size
+timeout = "2" ; at least one copy of the key was not stored as intended
+unknown-request = "998"
+version-not-supported = "999"
 ```

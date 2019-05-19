@@ -21,7 +21,7 @@ def _set_keys(cache, count):
             key = str(uuid4())
             value = str(uuid4())
             error = cache.set(key, value)
-            if error != Cache.Errors.NO_ERROR:
+            if error != Cache.Error.NO_ERROR:
                 print("E", end="")
                 stdout.flush()
             else:

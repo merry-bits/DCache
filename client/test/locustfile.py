@@ -44,7 +44,7 @@ class CacheClient(Cache):
         super_set = super().set
         response_time, error = _timeit(lambda: super_set(key, value))
         try:
-            if error != Cache.Errors.NO_ERROR:
+            if error != Cache.Error.NO_ERROR:
                 raise ValueError(f"error: {error}")
         except Exception as e:
             _request_failure("set", response_time, e)

@@ -2,17 +2,15 @@
 
 See "Request protocol" in README.
 """
-from enum import (
-    unique,
-    Enum,
-)
+from enum import Enum
+from enum import unique
 from logging import getLogger
 
+from dcache.cache import Cache
+from dcache.zmq import ENCODING
+from dcache.zmq import datetime_to_str
+from dcache.zmq import split_header
 from dcache.zmq import str_to_datetime
-from .cache import Cache
-from .zmq import ENCODING
-from .zmq import datetime_to_str
-from .zmq import split_header
 
 _LOG = getLogger(__name__)
 

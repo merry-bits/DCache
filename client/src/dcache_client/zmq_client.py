@@ -1,7 +1,5 @@
-from enum import (
-    Enum,
-    unique,
-)
+from enum import Enum
+from enum import unique
 from logging import getLogger
 
 # noinspection PyUnresolvedReferences
@@ -13,26 +11,28 @@ _LOG = getLogger(__name__)
 
 class Cache:
 
-    API_GET = "get"
+    _VERSION = b"1"
 
-    API_SET = "set"
+    _GET = b"get"
+
+    _SET = b"set"
 
     ENCODING = "utf-8"
 
     IO_TIMEOUT = 5 * 1000  # milliseconds
 
     @unique
-    class Errors(Enum):
+    class Error(Enum):
 
-        NO_ERROR = "0"
+        NO_ERROR = b"0"
 
-        TOO_BIG = "-1"
+        TOO_BIG = b"1"
 
-        TIMEOUT = "-2"
+        TIMEOUT = b"2"
 
-        NODE_ID_TAKE = "-998"
+        UNKNOWN_REQUEST = b"998"
 
-        VERSION_NOT_SUPPORTED = "-999"
+        VERSION_NOT_SUPPORTED = b"999"
 
     def __init__(self, server_api_address, context=None):
         if context is None:
@@ -46,15 +46,31 @@ class Cache:
         _LOG.debug(f"Connected to: {server_api_address}")
 
     def _make_request(self, *data):
-        parts = [part.encode(Cache.ENCODING) for part in data]
-        self._api_socket.send_multipart(parts)
+        self._api_socket.send_multipart(data)
         response = self._api_socket.recv_multipart()
-        return [part.decode(Cache.ENCODING) for part in response]
+        return response
 
     def get(self, key):
-        response = self._make_request(Cache.API_GET, key)
-        return response[0] if response else None
+        """
+
+        :type key: str
+        :rtype: str
+        """
+        key = key.encode(Cache.ENCODING)
+        response = self._make_request(Cache._VERSION, Cache._GET, key)
+        error = Cache.Error(response[0])
+        value = response[1] if error == Cache.Error.NO_ERROR else b""
+        value = value.decode(Cache.ENCODING)
+        return value
 
     def set(self, key, value):
-        error = self._make_request(Cache.API_SET, key, value or "")
-        return Cache.Errors(error[0]) if error else None
+        """
+
+        :type key: str
+        :type value: str
+        :rtype: Cache.Error
+        """
+        key = key.encode(Cache.ENCODING)
+        value = (value or "").encode(Cache.ENCODING)
+        error = self._make_request(Cache._VERSION, Cache._SET, key, value)
+        return Cache.Error(error[0])

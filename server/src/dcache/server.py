@@ -22,11 +22,13 @@ from zmq import (
     SNDTIMEO,
 )
 
+from dcache.protocols.api import APIProtocol
 from .cache import Cache
 from .nodes import Nodes
 from .nodes import index_for
-from .request_protocol import RequestProtocol
-from .request_protocol import RequestServer
+from .protocols.api import APIServer
+from .protocols.request import RequestProtocol
+from .protocols.request import RequestServer
 from .zmq import ENCODING
 from .zmq import datetime_to_str
 from .zmq import split_header
@@ -35,7 +37,7 @@ from .zmq import str_to_datetime
 _LOG = getLogger(__name__)
 
 
-class Server(RequestServer):
+class Server(RequestServer, APIServer):
     """A node server.
 
     Each node has a request URL where request are accepted and a service URL
@@ -120,10 +122,12 @@ class Server(RequestServer):
         self._pending_requests = {}  # id: (function(id, data), timeout_time)
         self._cache = Cache()
         self._nodes = Nodes(req_address, pub_address)
+        # Inject server.
         RequestProtocol.server = self
+        APIProtocol.server = self
         _LOG.info("node node_id: %s", self._nodes.node_id)
 
-    # === RequestServer begin
+    # === RequestServer begin, shared functions
 
     def send_multipart(self, data):
         return self._req_socket.send_multipart(data)
@@ -131,8 +135,9 @@ class Server(RequestServer):
     def get_cache_value(self, key):
         return self._cache.get(key)
 
-    def set_cache_value(self, key, value, timestamp):
-        return self._cache.set(key, value, timestamp, index_for(key))
+    def set_cache_value(self, key, value, timestamp, key_index=None):
+        key_index = index_for(key) if key_index is None else key_index
+        return self._cache.set(key, value, timestamp, key_index)
 
     def does_node_id_exist(self, node_id):
         if node_id == self._nodes.node_id:
@@ -163,28 +168,16 @@ class Server(RequestServer):
 
     # === RequestServer end
 
-    def _send_requests(
+    # === APIServer begin, additional functions
+
+    def send_api_multipart(self, data):
+        return self._api_socket.send_multipart(data)
+
+    def get_server_node_id(self):
+        return self._nodes.node_id
+
+    def send_requests(
             self, request_ids, sockets, build_request, handle_response):
-        """Using the ids send requests to nodes and register them as pending.
-
-        The error and remaining response frames will be passed to the
-        handle_request function. If a timeout occurs instead, None will be
-        passed in as the error.
-
-        :param request_ids: List of strings.
-        :type request_ids: iterable
-        :param sockets: Where to send the request to. zmq.Socket objects.
-        :type sockets: iterable
-        :param build_request: Function to construct the request frames
-        :type build_request: function(request_id, *data) -> [bytes]
-        :param handle_response: Function for handling any response. The first
-            argument for the function is the request id which was used to make
-            the request, followed by the error. The last argument are the the
-            remaining response frames. The error is None in case a timeout
-            occurred.
-        :type handle_response: function(bytes, RequestProtocol.Error, [bytes])
-        :return:
-        """
         if not request_ids:
             return
         # Send request and register ids as pending.
@@ -195,6 +188,22 @@ class Server(RequestServer):
             request_socket.send_multipart(data)
             self._pending_requests[request_id] = (handle_response, timeout)
             _LOG.debug("Added pending request %s", request_id)
+
+    def get_nodes_for_index(self, key_index):
+        return self._nodes.get_nodes_for_index(key_index)
+
+    def get_distribution_circles(self):
+        # noinspection PyProtectedMember
+        return self._nodes._distribution_circles
+
+    def get_cached_keys_count(self):
+        # noinspection PyProtectedMember
+        return len(self._cache._cache)
+
+    def get_cache_space_usage(self):
+        return self._cache.space_usage
+
+    # === APIServer end
 
     def _create_node(self, req_address, pub_address, last_seen):
         """Create request socket for node, register id and subscribe to the
@@ -297,144 +306,13 @@ class Server(RequestServer):
                 self._cache.set(key, None, None, None)
                 _LOG.debug("Removed key '%s', no longer needed.")
 
-    def _handle_api_get(self, header, key):
-        """Handle an API get request.
-
-        Always return the first response.
-        """
-        _, value = self._cache.get(key)
-        contact_others = False
-        nodes = self._nodes.get_nodes_for(key)
-        if value is None:
-            # Check if we should have it:
-            contact_others = self._nodes.node_id not in nodes
-        if not contact_others:
-            Server.send_multipart_str(self._api_socket, header, [value or ""])
-        else:
-            request_ids = [uuid4().bytes for _ in nodes]
-
-            # Generate functions to handle_request the response.
-            # noinspection PyUnusedLocal,PyShadowingNames,PyDefaultArgument
-            def handle_response(
-                    request_id, error, data, header=header,
-                    request_ids=request_ids):
-                """Handle get response, send the value back and cancel all
-                pending requests.
-
-                Send back "" if a timeout occurred.
-
-                :type request_id: bytes
-                :type error: RequestProtocol.Error or None
-                :param data: List of bytes, the result.
-                :type data: list
-                :type header: list
-                :param request_ids: List of all requests done for this api get
-                    request.
-                :return: All request ids that are now resolved.
-                """
-                if error != RequestProtocol.Error.NO_ERROR:
-                    data = ""
-                else:
-                    data = data[0].decode(ENCODING)  # data[1] = timestamp
-                Server.send_multipart_str(self._api_socket, header, [data])
-                return request_ids
-
-            build_request = (
-                lambda rid: RequestProtocol.build_get_request(rid, key))
-            sockets = (node.req_socket for node in nodes.values())
-            self._send_requests(
-                request_ids, sockets, build_request, handle_response)
-
-    def _handle_api_set(self, header, key, value):
-        """Handle an API set request.
-
-        Set the value on all nodes and return "0" if all nodes report "0" else
-        return "-1". If a timeout happened return "-2".
-
-        :param header: List of bytes, header for sending back the response.
-        :type key: str
-        :type value: str
-        """
-        key_index = index_for(key)
-        server_node_id = self._nodes.node_id  # shortcut
-        nodes = self._nodes.get_nodes_for_index(key_index)
-        other_node_ids = [
-            node_id for node_id in nodes if node_id != server_node_id]
-        # Prepare requests ids for other nodes.
-        request_ids = [uuid4().bytes for _ in other_node_ids]
-
-        # Generate functions to handle_request the responses from other nodes.
-        # Answer to client once all nodes reported back or a timeout happens.
-        # noinspection PyShadowingNames,PyDefaultArgument
-        def handle_response(
-                request_id, error, data, header=header, request_ids=request_ids,
-                responses=[], responses_count=len(nodes)):
-            """Keep track of what nodes respond.
-
-            Once all results are in or a timeout happened send the right result
-            back to the api set request.
-
-            :type request_id: bytes
-            :type error: RequestProtocol.Error or None
-            :param data: List of strings, the result.
-            :type data: list
-            :type header: list
-            :param request_ids: List of all requests done for this api get
-                request.
-            :param responses: List for keeping track of what nodes responded so
-                far.
-            :param responses_count:
-            :return: All request ids that are now resolved.
-            """
-            # noinspection PyPep8Naming
-            Errors = Server.Errors  # shortcut
-            _LOG.debug(
-                "Set %s %s %s %s, %s", responses_count, responses, request_ids,
-                error, data)
-            result = None
-            if error is None:
-                result = Errors.TIMEOUT
-            else:
-                responses.append(error)
-                if len(responses) == responses_count:
-                    # Done, this was the last node responding. Send result.
-                    no_error = all(
-                        r == RequestProtocol.Error.NO_ERROR for r in responses)
-                    result = Errors.NO_ERROR if no_error else Errors.TOO_BIG
-            if result is not None:
-                Server.send_multipart_str(
-                    self._api_socket, header, [result.value])
-                _LOG.debug("Set response: %s", result)
-            # On timeout cancel all pending request, otherwise only the current
-            # one.
-            return request_ids if error is None else [request_id]
-
-        now = datetime.utcnow()
-        if request_ids:
-            build_request = (
-                lambda rid:
-                    RequestProtocol.build_set_request(rid, key, value, now))
-            sockets = (
-                node.req_socket
-                for node_id, node in nodes.items() if node_id != server_node_id)
-            _LOG.debug("Set key %s on nodes %s.", key, other_node_ids)
-            self._send_requests(
-                request_ids, sockets, build_request, handle_response)
-        if self._nodes.node_id in nodes:
-            error = self._cache.set(key, value, now, key_index)
-            # noinspection PyPep8Naming
-            TOO_BIG = Cache.Error.TOO_BIG  # shortcut
-            # noinspection PyPep8Naming
-            Error = RequestProtocol.Error  # shortcut
-            error = Error.TOO_BIG if error == TOO_BIG else Error.NO_ERROR
-            handle_response(b"", error, [])
-
     def _step_handle_request_answers(self, socket, node_id):
         # See if a message on one of the nodes arrived.
         completed_requests = []
         data = socket.recv_multipart()
         request_id, error, data = RequestProtocol.read_answer(data)
         if request_id:
+            # Handle the answer if possible.
             handler = self._pending_requests.get(request_id)
             if handler:
                 handled_ids = handler[0](request_id, error, data)
@@ -483,28 +361,12 @@ class Server(RequestServer):
             now = datetime.utcnow()
             # Handle API requests.
             if self._api_socket in sockets:
-                header, data = Server.recv_multipart_str(self._api_socket)
-                action = data[0]
-                data = data[1:]
-                if action == Server.API_GET:
-                    self._handle_api_get(header, *data)
-                elif action == Server.API_SET:
-                    self._handle_api_set(header, *data)
-                elif action == "status":
-                    cache_items = (
-                        f"{k}={v.value}" for k, v in self._cache.items())
-                    # noinspection PyProtectedMember
-                    data = [
-                        f"{self._nodes.node_id}",
-                        f"{','.join(self._nodes.nodes.keys())}",
-                        f"{self._nodes._distribution_circles[0]}",
-                        f"{len(self._cache)}",
-                        f"{self._cache.space_usage}",
-                        f"{','.join(cache_items)}",
-                    ]
-                    Server.send_multipart_str(self._api_socket, header, data)
-                else:
-                    _LOG.debug("Unknown API request %s.", action)
+                data = self._api_socket.recv_multipart()
+                handler = APIProtocol.handler_for(data)
+                handled = handler.handle_request()
+                if not handled:
+                    _LOG.error("API request not handled!")
+                    assert True
             # Incoming requests?
             if self._req_socket in sockets:
                 data = self._req_socket.recv_multipart()
@@ -580,7 +442,7 @@ class Server(RequestServer):
                 RequestProtocol.build_connect_to_cluster_request(
                     rid, self._nodes.node_id, self._req_address,
                     self._pub_address))
-        self._send_requests(
+        self.send_requests(
             [request_id.bytes], [self._register_socket], build_request,
             handle_response)
 
