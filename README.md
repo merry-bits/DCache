@@ -29,13 +29,16 @@ Both the server and the command line client need a Python 3 environment and use
 their set of parameters. Both accept `--help` and will show what is available
 or needed.
 
+To change the cache size (measured in characters) change the `MAX_SIZE` value in
+[cache.py](server/src/dbcache/cache.py) before the server instance gets created.
 
-### Node
+
+### Server node
 
 Run a node with:
 ```
     $ cd server/src
-    $ ./run.py <REQUEST ADDRESS> <PUBLICATION ADDRESS> <API ADDRESS>
+    $ ./run.py <REQUEST ADDRESS> <PUBLISH ADDRESS> <API ADDRESS>
 ```
 
 Each node needs three ZeroMQ socket address descriptors (the likes of
@@ -77,10 +80,10 @@ not seen by at least one node within a certain amount of time each node starts
 to remove that node from the list.
 
 
-### Publication protocol
+### Publish protocol
 
 ```
-publication = S:(node-topic *node)
+publish = S:(node-topic *node)
 node-topic = "n"
 node = node-id request-address publication-address last-seen
 last-seen = YEAR : MONTH : DAY : HOUR : MINUTES : SECONDS ; UTC, Unix time

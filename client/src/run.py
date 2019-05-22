@@ -17,7 +17,7 @@ if __name__ == "__main__":
     args_key = args.key
     if args.key == "status":
         # noinspection PyProtectedMember
-        print(client._make_request("status"))
+        print(client._make_request(client._VERSION, b"status"))
     elif args.set is None:
         get_value = client.get(args_key)
         print(f"Value: {get_value}")

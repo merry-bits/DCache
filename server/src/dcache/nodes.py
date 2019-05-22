@@ -1,10 +1,8 @@
 from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import (
-    datetime,
-    timedelta,
-)
+from datetime import datetime
+from datetime import timedelta
 from hashlib import md5
 from logging import getLogger
 from sys import byteorder

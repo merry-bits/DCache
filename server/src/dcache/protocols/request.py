@@ -5,6 +5,7 @@ See "Request protocol" in README.
 from enum import Enum
 from enum import unique
 from logging import getLogger
+from uuid import uuid4
 
 from dcache.cache import Cache
 from dcache.zmq import ENCODING
@@ -76,10 +77,10 @@ class RequestServer:
         """
         raise NotImplementedError()
 
-    def redistribute(self, node_id):
-        """The given node id was added, update distribution circle etc.
+    def redistribute(self, *node_ids):
+        """The given node ids where added, update distribution circle etc.
 
-        :type node_id: str
+        :type node_ids: str
         """
         raise NotImplementedError()
 
@@ -349,18 +350,16 @@ class _ConnectRequest(RequestProtocol):
         added_node = server.add_node(node_id, req_address, pub_address)
         if added_node:
             # Forward request.
-            new_node = (node_id, req_address, pub_address)
-            new_node = (part.encode(ENCODING) for part in new_node)
-            new_node = [
-                b"", RequestProtocol._Type.CONNECT_TO_CLUSTER.value, *new_node]
+            request_id = uuid4().bytes
+            new_node = RequestProtocol.build_connect_to_cluster_request(
+                request_id, node_id, req_address, pub_address)
             for cluster_node_id in other_node_ids:
                 server.send_multipart_to(cluster_node_id, new_node)
             # Move data.
             server.redistribute(node_id)
             # Send response.
             response = server.get_server_node_info()
-            response = (part.encode(ENCODING) for part in response)
-            self._send(response=response)
+            self._send(response=(part.encode(ENCODING) for part in response))
         else:
             self._send(error=RequestProtocol.Error.NODE_ID_TAKEN)
         return True

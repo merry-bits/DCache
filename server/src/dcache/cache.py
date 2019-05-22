@@ -1,11 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime
-from enum import (
-    unique,
-    Enum,
-)
+from enum import Enum
+from enum import unique
 from logging import getLogger
-
 
 _LOG = getLogger(__name__)
 
@@ -16,7 +13,6 @@ class Cache:
 
     Each key has the following information stored:
     - time stamp of when the key was set
-#    - list of nodes (ids) where the key should be stored
     - value of the key
     """
 

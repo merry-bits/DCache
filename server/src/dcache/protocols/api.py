@@ -379,7 +379,7 @@ class _StatusRequest(APIProtocol):
         server = APIProtocol.server  # shortcut
         # noinspection PyProtectedMember
         data = [
-            f"{server.get_server_node_id}",
+            f"{server.get_server_node_id()}",
             f"{','.join(server.get_other_node_ids())}",
             f"{server.get_distribution_circles()}",
             f"{server.get_cached_keys_count()}",
