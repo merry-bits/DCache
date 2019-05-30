@@ -1,34 +1,43 @@
-# -*- coding: utf-8 -*-
-from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
+from datetime import timedelta
+from itertools import chain
 from logging import getLogger
-from random import choice
-from threading import Thread
-from uuid import uuid1
-from wsgiref import simple_server
+from uuid import uuid4
 
+# noinspection PyUnresolvedReferences
+from zmq import DEALER
+# noinspection PyUnresolvedReferences
+from zmq import POLLIN
+# noinspection PyUnresolvedReferences
+from zmq import PUB
+# noinspection PyUnresolvedReferences
 from zmq import Poller
-from zmq import REP, REQ, PUB, SUB, PULL, POLLIN  # @UnresolvedImport
-from zmq import SUBSCRIBE, RCVTIMEO, SNDTIMEO  # @UnresolvedImport
+# noinspection PyUnresolvedReferences
+from zmq import RCVTIMEO
+# noinspection PyUnresolvedReferences
+from zmq import ROUTER
+# noinspection PyUnresolvedReferences
+from zmq import SNDTIMEO
+# noinspection PyUnresolvedReferences
+from zmq import SUB
+# noinspection PyUnresolvedReferences
+from zmq import SUBSCRIBE
 
-from .api import app, set_config, SUB_ENDPOINT, PUSH_ENDPOINT
-from .cache import Cache, key_index
+from dcache.protocols.api import APIProtocol
+from dcache.protocols.publish import PublishProtocol
+from dcache.protocols.publish import PublishServer
+from .cache import Cache
 from .nodes import Nodes
-
+from .nodes import index_for
+from .protocols.api import APIServer
+from .protocols.request import RequestProtocol
+from .protocols.request import RequestServer
+from .zmq import ENCODING
 
 _LOG = getLogger(__name__)
 
 
-def _dt_to_str(dt):
-    return "{}:{}:{}:{}:{}:{}".format(
-        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
-
-
-def _str_to_dt(s):
-    return datetime(*map(int, s.split(":")))
-
-
-class Server():
+class Server(RequestServer, APIServer, PublishServer):
     """A node server.
 
     Each node has a request URL where request are accepted and a service URL
@@ -48,338 +57,364 @@ class Server():
     accordingly.
     """
 
-    PUB_INTERVALL = timedelta(seconds=5)
+    PUB_INTERVAL = timedelta(seconds=5)
 
     IO_TIMEOUT = 5 * 1000  # milliseconds
 
-    CMD_NEW = "new"
+    def __init__(
+            self, context, req_address, pub_address, api_address,
+            register_address=None):
+        """
 
-    CMD_GET = "get"
-
-    CMD_SET = "set"
-
-    def __init__(self, context, req_address, pub_address):
+        :type context: zmq.Context
+        :type req_address: str
+        :type pub_address: str
+        :type api_address: str
+        :type register_address: str
+        """
+        self._last_published = datetime(1970, 1, 1)  # never
+        self._register_address = register_address
         self._context = context
+        self._req_address = req_address
+        self._pub_address = pub_address
+        self._api_address = api_address
+        self._req_socket = None
+        self._pub_socket = None
+        self._api_socket = None
+        self._sub_socket = None
+        self._register_socket = None  # connect to cluster, one time use
+        # noinspection SpellCheckingInspection
         self._poller = Poller()
-        self._nodes_sockets = {}  # requests and service sockets
-        # FIFO request queue for nodes: [in_progress, data, callback(response)]
-        self._nodes_requests = defaultdict(list)  # requests queues for nodes
-        self._cache = Cache()  # the cache
-        node_id = uuid1().hex  # unique node id, based on current time
-        _LOG.info("node id: %s", node_id)
-        self._nodes = Nodes(node_id, req_address, pub_address)  # other nodes
+        self._pending_requests = {}  # id: (f(id, error, data), timeout_time)
+        self._cache = Cache()
+        self._nodes = Nodes(req_address, pub_address)
+        # Inject server.
+        RequestProtocol.server = self
+        APIProtocol.server = self
+        PublishProtocol.server = self
+        _LOG.info("node node_id: %s", self._nodes.node_id)
 
-    def _open_req_socket(self, addr):
-        req_socket = self._context.socket(REQ)
-        req_socket.setsockopt(RCVTIMEO, self.IO_TIMEOUT)
-        req_socket.connect(addr)
-        self._poller.register(req_socket, POLLIN)
-        return req_socket
-
-    def _open_sub_socket(self, addr):
-        sub_socket = self._context.socket(SUB)
-        sub_socket.setsockopt_string(SUBSCRIBE, "")
-        sub_socket.connect(addr)
-        self._poller.register(sub_socket, POLLIN)
-        return sub_socket
-
-    def _add_request(self, node_id, data, callback):
-        """Adds a new request for a particular node.
-
-        Each request in the queue consists of:
-        - in progress flag
-        - data to be send
-        - function (with one argument, the response) to be called when the
-            response is ready
+    def _prepare(self, socket, register_to_poller=POLLIN):
         """
-        self._nodes_requests[node_id].append([False, data, callback])
 
-    def _hanlde_subscriptions(self, poll_sockets):
-        """Read the nodes list from each other node and merge the information
-        into the local node list.
-
-        :return: true if nodes where added
+        :type socket: zmq.Socket
+        :type register_to_poller: int
         """
-        added = []
-        for node_id, (_, pub_socket) in self._nodes_sockets.items():
-            if pub_socket in poll_sockets:
-                node_id, nodes = pub_socket.recv_json()
-                # Convert string to datetime.
-                nodes = {
-                    i: (req_addr, pub_addr, _str_to_dt(last))
-                    for i, (req_addr, pub_addr, last) in nodes.items()}
-                # Merge nodes list.
-                new_nodes = self._nodes.update_nodes(nodes)
-                # Create sockets for new nodes.
-                for node_id, req_addr, pub_addr in new_nodes:
-                    _LOG.debug("adding node: %s", node_id)
-                    req_socket = self._open_req_socket(req_addr)
-                    sub_socket = self._open_sub_socket(pub_addr)
-                    added.append((node_id, (req_socket, sub_socket)))
-        self._nodes_sockets.update(dict(added))  # save sockets
-        return len(added) > 0  # nodes list got changed?
+        socket.setsockopt(RCVTIMEO, self.IO_TIMEOUT)
+        socket.setsockopt(SNDTIMEO, self.IO_TIMEOUT)
+        if register_to_poller is not None:
+            self._poller.register(socket, register_to_poller)
 
-    def _add_node(self, node_id, req_addr, pub_addr, req_socket=None):
-        """Add one node to the list and create the sockets for the request
-        and service URLs (subscribe to the node).
+    def _create_node(self, req_address, pub_address, last_seen):
+        """Create request socket for node, register id and subscribe to the
+        publication address.
+
+        :type req_address: str
+        :type pub_address: str
+        :type last_seen: datetime.datetime
         """
-        _LOG.debug("adding node: %s", node_id)
-        # Add node to the nodes list.
-        self._nodes.add_node(node_id, req_addr, pub_addr)
-        if req_socket is None:  # does that not yet exist?
-            req_socket = self._open_req_socket(req_addr)
-        sub_socket = self._open_sub_socket(pub_addr)
-        # Remember sockets.
-        self._nodes_sockets[node_id] = (req_socket, sub_socket)
+        request_socket = self._context.socket(DEALER)
+        self._prepare(request_socket)
+        request_socket.connect(req_address)
+        self._sub_socket.connect(pub_address)
+        _LOG.debug("Subscribed to %s", pub_address)
+        # noinspection PyCallByClass
+        return Nodes.Node(req_address, pub_address, last_seen, request_socket)
 
-    def _remove_nodes(self, removed_nodes):
-        """Unregister and remove a node, remove all pending request, too.
+    def _destroy_node(self, node):
+        """Clean up.
+
+        Unsubscribe from pub address and remove request socket from poller.
+
+        :type node: Nodes.Node
+        :return:
         """
-        for node_id in removed_nodes:
-            _LOG.debug("removing node: %s", node_id)
-            # Unregister sockets from poller.
-            req_socket, pub_socket = self._nodes_sockets.get(
-                node_id, (None, None))
-            if req_socket is not None:
-                self._poller.unregister(req_socket)
-            if pub_socket is not None:
-                self._poller.unregister(pub_socket)
-            # Forget the sockets and erase request queue.
-            self._nodes_sockets.pop(node_id, None)
-            self._nodes_requests.pop(node_id, None)
-        return len(removed_nodes) > 0  # nodes list got changed?
+        self._sub_socket.disconnect(node.pub_address)
+        _LOG.debug("Unsubscribed from %s", node.pub_address)
+        self._poller.unregister(node.req_socket)
+        _LOG.debug("Removed node: %s %s", node.req_address, node.pub_address)
 
-    def _handle_responses(self, poll_sockets):
-        """When a request from the queue gets an answer call the function for
-        that request, if possible.
+    def _handle_connect_response(self, request_id, error, response):
         """
-        for node_id, (req_socket, _) in self._nodes_sockets.items():
-            # Some node did replay?
-            if req_socket in poll_sockets:
-                # Get the answer and call the callback function with it, if
-                # there was one.
-                response = req_socket.recv_json()
-                requests = self._nodes_requests[node_id]
-                if requests:
-                    in_progress, _, callback = requests[0]
-                    if in_progress:
-                        callback(response)
-                        # Request done, remove it from the queue.
-                        self._nodes_requests[node_id] = requests[1:]
 
-    def _handle_request(self, node_changes, action, data):
-        # Handle the requested action.
-        _LOG.debug("Request %s: %s", action, str(data))
-        if action == self.CMD_NEW:  # new node, register it
-            node_id, req_addr, pub_addr = data
-            self._add_node(node_id, req_addr, pub_addr)
-            node_changes[0] = True  # a node was added!
-            return (self._nodes.id, self._nodes.pub_address)
-        if action == self.CMD_SET:  # set a key and value
-            key, timestamp, value = data
-            timestamp = _str_to_dt(timestamp)
-            return self._cache.set(
-                key, value, timestamp,
-                self._nodes.get_nodes_for_index(key_index(key)))
-        if action == self.CMD_GET:  # return value for a key
-            in_cache, timestamp, value = self._cache.get(data)
-            return (in_cache, _dt_to_str(timestamp), value)
-
-    def _rebalance(self):
-        """ Check if key should be on some other nodes now, move/delete as
-        necessary.
+        :type request_id: str
+        :type error: RequestProtocol.Error
+        :type response: [bytes]
+        :rtype: [str]
         """
-        send_entries = defaultdict(list)
-        remove_entries = []
-        # Loop through all keys and compare on which nodes they should be.
-        for key, ts, nodes, value, index in self._cache.key_indices:
-            new_nodes = self._nodes.get_nodes_for_index(index)
-            if new_nodes != nodes:  # node list for that key changed?
-                if self._nodes.id not in new_nodes:
-                    remove_entries.append(key)  # no longer local
-                for new_node in new_nodes - nodes:  # where should they be?
-                    send_entries[new_node].append((key, ts, value))
-                self._cache.set(key, value, ts, new_nodes)  # save new nodelist
-        # Queue requests to set the keys on the new nodes.
-        moves = 0
-        for new_node, entries in send_entries.items():
-            if new_node != self._nodes.id:
-                for key, ts, value in entries:
-                    self._add_request(
-                        new_node, (self.CMD_SET, (key, _dt_to_str(ts), value)),
-                        lambda response: None)
-                    moves += 1
-        # Remove dead nodes from cache.
-        for key in remove_entries:
-            self._cache.delete_key(key)
-        _LOG.debug(
-            "adjusted distribution, %d moves, %d deletes", moves,
-            len(remove_entries))
+        # Close register socket, not needed anymore.
+        self._poller.unregister(self._register_socket)
+        self._register_socket = None
+        if error != RequestProtocol.Error.NO_ERROR:
+            raise RuntimeError("Could not register node, error: %s", error)
+        node_id, req_address, pub_address = (
+            part.decode(ENCODING) for part in response)
+        now = datetime.utcnow()
+        # Register remote node.
+        added_nodes = self._nodes.update_nodes(
+            {node_id: (req_address, pub_address, now)}, self._create_node)
+        if not added_nodes or added_nodes[0] != node_id:
+            raise RuntimeError(
+                "Could not accept cluster node %s", self._register_address)
+        self.redistribute(node_id)
+        return [request_id]
 
-    def _handle_api_get(self, api_pub_socket, req_id, key):
-        """Handle a API get request from the local API.
+    def _connect(self):
+        """Register and connect to an existing cluster.
 
-        If the key is not local, send a request to one of the responsible
-        nodes. Upon arrival of the response publish the response for the API,
-        using the request id, which only the right listens for.
+        Use a one time socket to send a CMD_NEW request to the other server.
+        Add the other server as a new node, once the response is available.
+
         """
-        req_id = req_id.encode("utf-8")
+        assert self._register_socket is None
+        if not self._register_address:
+            return
+        # Create socket.
+        _LOG.debug("Registering to %s", self._register_address)
+        self._register_socket = self._context.socket(DEALER)
+        self._prepare(self._register_socket)  # timeout, poller
+        self._register_socket.connect(self._register_address)
+        # Make request.
+        request_id = uuid4().bytes
+        build_request = (
+            lambda rid:
+                RequestProtocol.build_connect_to_cluster_request(
+                    rid, self._nodes.node_id, self._req_address,
+                    self._pub_address))
+        self.send_requests(
+            [request_id], [self._register_socket], build_request,
+            self._handle_connect_response)
 
-        # Publish the result.
-        def send_response(resp, req_id=req_id, api_pub_socket=api_pub_socket):
-            found, _, value = resp
-            found = b"1" if found else b"0"
-            value = value.encode("utf-8") if value else b""
-            api_pub_socket.send_multipart([req_id, found, value])
-
-        # Where is the key stored?
-        nodes = self._nodes.get_nodes_for_index(key_index(key))
-        if nodes:
-            if self._nodes.id in nodes:  # local answer directly
-                in_cache, _, value = self._cache.get(key)
-                send_response((in_cache, None, value))
-            else:  # remote, make request
-                node_id = choice(list(nodes))
-                self._add_request(node_id, (self.CMD_GET, key), send_response)
-        else:  # can not be stored in cache, for whatever strange reason
-            send_response((False, None, None))
-
-    def _handle_api_set(self, api_pub_socket, req_id, key, value):
-        """Handle a API set request from the local API.
-
-        Check where the key should be stored and make the appropriate requests.
-        The publish all results to the API, alltough the API only cares about
-        the fastest response.
+    def _step_handle_request_answers(self, socket, node_id):
         """
-        req_id = req_id.encode("utf-8")
 
-        def send_response(resp, req_id=req_id, api_pub_socket=api_pub_socket):
-            resp = str(resp).encode("utf-8")  # "0", "-1", ...
-            api_pub_socket.send_multipart([req_id, resp])
-
-        # Where should the key go?
-        nodes = self._nodes.get_nodes_for_index(key_index(key))
-        if nodes:
-            timestamp = datetime.now()
-            if self._nodes.id in nodes:  # save locally and publish response
-                resp = self._cache.set(key, value, timestamp, nodes)
-                send_response(resp)
-                nodes.remove(self._nodes.id)  # done with local node!
-            for node_id in nodes:  # make requests to all remote nodes
-                self._add_request(
-                    node_id,
-                    (self.CMD_SET, (key, _dt_to_str(timestamp), value)),
-                    send_response)
-        else:
-            send_response(-2)  # no nodes
-
-    def loop(self, api_port, req_addr):
-        """Event loop, listen to all sockets and handle all messages.
-
-        If a req_address of an existing node is given the this node will
-        register itself there, before entering the loop.
-
-        The request on the api_port are handled by a Python WSGI instance
-        running the Flask API app.
+        :type socket: zmq.Socket
+        :type node_id: str
         """
-        # Register to existing node?
-        if req_addr is not None:
-            _LOG.debug("Contacting %s", req_addr)
-            req_socket = self._open_req_socket(req_addr)
-            req_socket.send_json(
-                (self.CMD_NEW,
-                    (self._nodes.id, self._nodes.req_address,
-                        self._nodes.pub_address)))
-            node_id, pub_addr = req_socket.recv_json()
-            _LOG.debug("Received: %s %s", str(node_id), pub_addr)
-            self._add_node(node_id, req_addr, pub_addr, req_socket)
-            self._rebalance()
+        # See if a message on one of the nodes arrived.
+        data = socket.recv_multipart()
+        request_id, error, data = RequestProtocol.read_answer(data)
+        if not request_id:
+            _LOG.debug("Ignoring response with no request id.")
+            return
+        # Handle the answer if possible.
+        handler, _ = self._pending_requests.get(request_id, (None, None))
+        if handler is None:
+            _LOG.debug("Ignoring response %s from %s", request_id, node_id)
+            return
+        # noinspection PyCallingNonCallable
+        completed_requests = handler(request_id, error, data)
+        _LOG.debug("Handled response from %s, %s", node_id, completed_requests)
+        # Remove pending requests.
+        for request_id in completed_requests:
+            self._pending_requests.pop(request_id, None)
 
-        # Create request and service sockets.
-        nodes_publisher = self._context.socket(PUB)
-        nodes_publisher.setsockopt(RCVTIMEO, self.IO_TIMEOUT)
-        nodes_publisher.setsockopt(SNDTIMEO, self.IO_TIMEOUT)
-        _LOG.debug("Publishing on %s", self._nodes.pub_address)
-        nodes_publisher.bind(self._nodes.pub_address)
-        req_socket = self._context.socket(REP)
-        req_socket.setsockopt(RCVTIMEO, self.IO_TIMEOUT)
-        req_socket.setsockopt(SNDTIMEO, self.IO_TIMEOUT)
-        _LOG.debug("waiting for requests on %s", self._nodes.req_address)
-        req_socket.bind(self._nodes.req_address)
-        self._poller.register(req_socket, POLLIN)
+    def _step_handle_timeouts(self, now):
+        """
 
-        # Create in-process sockets to the API app.
-        api_pull_socket = self._context.socket(PULL)
-        api_pull_socket.bind(PUSH_ENDPOINT)
-        self._poller.register(api_pull_socket, POLLIN)
-        api_pub_socket = self._context.socket(PUB)
-        api_pub_socket.bind(SUB_ENDPOINT)
+        :type now: datetime.datetime
+        """
+        # Handle timeouts on pending requests.
+        completed_requests = [
+            handler(request_id, None, None)
+            for request_id, (handler, timeout) in self._pending_requests.items()
+            if timeout < now
+        ]
+        # Clean up completed_requests timeouts.
+        for request_id in chain.from_iterable(completed_requests):
+            self._pending_requests.pop(request_id, None)
 
-        _LOG.info("Entering server loop")
-        # Start web server.
-        set_config(self._context)
-        httpd = simple_server.make_server(
-            '0.0.0.0', int(api_port), app)
-        Thread(target=httpd.serve_forever).start()
+    def _step_remove_dead_nodes(self):
+        removed_nodes = []
+        for node_id, node in self._nodes.remove_dead_nodes():
+            self._destroy_node(node)
+            removed_nodes.append(node_id)
+        self.redistribute(*removed_nodes)
+
+    def _step(self, sockets):
+        """
+
+        :param sockets: Result from poller, dictionary of socket: event.
+        """
+        now = datetime.utcnow()
+        # Handle API requests.
+        if self._api_socket in sockets:
+            data = self._api_socket.recv_multipart()
+            if not APIProtocol.handler_for(data).handle_request():
+                _LOG.error("API request not handled!")
+                assert True
+        # Incoming requests?
+        if self._req_socket in sockets:
+            data = self._req_socket.recv_multipart()
+            if not RequestProtocol.handler_for(data).handle_request():
+                _LOG.error("Request not handled!")
+                assert True
+        # Handle pending requests.
+        if self._register_socket and self._register_socket in sockets:
+            self._step_handle_request_answers(self._register_socket, "-")
+        for node_id, node in self._nodes.nodes.items():
+            if node.req_socket in sockets:
+                self._step_handle_request_answers(node.req_socket, node_id)
+        # Handle pending request which did not get an answer in time.
+        self._step_handle_timeouts(now)
+        # Handle incoming node updates (subscriptions).
+        if self._sub_socket in sockets:
+            PublishProtocol.handle(self._sub_socket.recv_multipart())
+        # Remove dead nodes.
+        self._step_remove_dead_nodes()
+        # Publish nodes?
+        if now - self._last_published > self.PUB_INTERVAL:
+            self._last_published = now
+            self._pub_socket.send_multipart(PublishProtocol.build_publish())
+
+    def loop(self):
+        """Event loop, listen to all sockets and handle_request all messages.
+
+        Expected to be called only once!
+        """
+        assert self._req_address
+        assert self._req_socket is None
+        assert self._pub_address
+        assert self._pub_socket is None
+        assert self._api_address
+        assert self._api_socket is None
+        assert self._sub_socket is None
+        # Create publish and request sockets.
+        self._pub_socket = self._context.socket(PUB)
+        self._prepare(self._pub_socket, register_to_poller=False)
+        self._pub_socket.bind(self._pub_address)
+        _LOG.debug("Publishing on %s", self._pub_address)
+        self._req_socket = self._context.socket(ROUTER)
+        self._prepare(self._req_socket)  # timeout, poller
+        self._req_socket.bind(self._req_address)
+        _LOG.debug("Waiting for requests on %s", self._req_address)
+        # API socket.
+        self._api_socket = self._context.socket(ROUTER)
+        self._prepare(self._api_socket)  # timeout, poller
+        self._api_socket.bind(self._api_address)
+        _LOG.debug("Waiting for API requests on %s", self._api_address)
+        # Subscriber.
+        self._sub_socket = self._context.socket(SUB)
+        self._sub_socket.setsockopt(SUBSCRIBE, PublishProtocol.TOPIC)
+        self._poller.register(self._sub_socket, POLLIN)
+        # Send connect to cluster request?
+        self._connect()
         # Enter ZMQ loop.
+        timeout = self.PUB_INTERVAL.seconds * 1000
         stop = False
-        last_published = None
-        try:
-            while not stop:
-                try:
-                    # Wait for messages, but not too long!
-                    sockets = dict(
-                        self._poller.poll(self.PUB_INTERVALL.seconds * 1000))
-                except KeyboardInterrupt:
-                    stop = True
-                else:
-                    changes = [False]
-                    # Handle incoming node updates (subscriptions).
-                    if self._hanlde_subscriptions(sockets):
-                        changes[0] = True
-                    # Handle incoming responses.
-                    self._handle_responses(sockets)
-                    # Incoming requests?
-                    if req_socket in sockets:
-                        req_socket.send_json(
-                            self._handle_request(
-                                changes, *req_socket.recv_json()))
-                    # Remove dead nodes?
-                    if self._remove_nodes(self._nodes.remove_dead_nodes()):
-                        changes[0] = True
-                    # Did nodes change?
-                    if changes[0]:
-                        self._rebalance()
-                    # Request something?
-                    for node_id, requests in self._nodes_requests.items():
-                        if requests and not requests[0][0]:
-                            request = requests[0]
-                            request[0] = True  # in progress
-                            self._nodes_sockets[node_id][0].send_json(
-                                request[1])
-                    # Publish something?
-                    now = datetime.now()
-                    if (last_published is None or
-                            now - last_published > self.PUB_INTERVALL):
-                        # Get nodes, convert last datetime to string
-                        nodes = {
-                            i: (req_addr, pub_addr, _dt_to_str(last))
-                            for i, (req_addr, pub_addr, last)
-                            in self._nodes.nodes.items()}
-                        _LOG.debug(
-                            "publishing:\n%s", "\n".join(
-                                "{}: {}".format(i, str(n))
-                                for i, n in nodes.items()))
-                        nodes_publisher.send_json((self._nodes.id, nodes))
-                        last_published = now
-                    # Handle API get requests
-                    if api_pull_socket in sockets:
-                        req_id, action, key, value = (
-                            api_pull_socket.recv_json())
-                        if action == "get":
-                            self._handle_api_get(api_pub_socket, req_id, key)
-                        if action == "set":
-                            self._handle_api_set(
-                                api_pub_socket, req_id, key, value)
-        finally:
-            httpd.shutdown()
+        while not stop:
+            try:
+                # Wait for messages, but not too long!
+                sockets = dict(self._poller.poll(timeout))
+            except KeyboardInterrupt:
+                stop = True
+            else:
+                self._step(sockets)
+
+    # === RequestServer begin, shared functions
+
+    def send_multipart(self, data):
+        return self._req_socket.send_multipart(data)
+
+    def get_cache_value(self, key):
+        return self._cache.get(key)
+
+    def set_cache_value(self, key, value, timestamp, key_index=None):
+        key_index = index_for(key) if key_index is None else key_index
+        return self._cache.set(key, value, timestamp, key_index)
+
+    def does_node_id_exist(self, node_id):
+        if node_id == self._nodes.node_id:
+            return True
+        return node_id in self._nodes.nodes
+
+    def add_node(self, node_id, request_address, publish_address):
+        now = datetime.utcnow()
+        added_nodes = self._nodes.update_nodes(
+            {node_id: (request_address, publish_address, now)},
+            self._create_node)
+        return added_nodes and added_nodes[0] == node_id
+
+    def get_other_node_ids(self):
+        return set(self._nodes.nodes.keys())
+
+    def send_multipart_to(self, node_id, data):
+        node = self._nodes.nodes.get(node_id)
+        if node:
+            return node.req_socket.send_multipart(data)
+        return None
+
+    def redistribute(self, *node_ids):
+        if not node_ids:
+            return
+        keys = ((key, entry.hash_index) for key, entry in self._cache.items())
+        send_list, keep = self._nodes.redistribute(keys, *node_ids)
+        for key, node_ids in send_list.items():
+            if node_ids:
+                entry = self._cache.get(key)
+                if entry is not None:
+                    last_update, value = entry
+                    # Request id gets ignored for the purpose of handling the
+                    # responses. Reuse the same for all requests.
+                    data = RequestProtocol.build_set_request(
+                        uuid4().bytes, key, value, last_update)
+                    for node_id in node_ids:
+                        socket = self._nodes.nodes[node_id].req_socket
+                        socket.send_multipart(data)
+                        _LOG.debug("Redistributing '%s' to %s", key, node_id)
+        for key, should_keep in keep.items():
+            if not should_keep:
+                self._cache.set(key, None, None, None)
+                _LOG.debug("Removed key '%s', no longer needed.")
+
+    def get_server_node_info(self):
+        return self._nodes.node_id, self._req_address, self._pub_address
+
+    # === RequestServer end
+
+    # === APIServer begin, additional functions
+
+    def send_api_multipart(self, data):
+        return self._api_socket.send_multipart(data)
+
+    def get_server_node_id(self):
+        return self._nodes.node_id
+
+    def send_requests(
+            self, request_ids, sockets, build_request, handle_response):
+        if not request_ids:
+            return
+        # Send request and register ids as pending.
+        now = datetime.utcnow()
+        timeout = now + timedelta(milliseconds=Server.IO_TIMEOUT)
+        for request_id, request_socket in zip(request_ids, sockets):
+            data = build_request(request_id)
+            request_socket.send_multipart(data)
+            self._pending_requests[request_id] = (handle_response, timeout)
+            _LOG.debug("Added pending request %s", request_id)
+
+    def get_nodes_for_index(self, key_index):
+        return self._nodes.get_nodes_for_index(key_index)
+
+    def get_distribution_circles(self):
+        # noinspection PyProtectedMember
+        return self._nodes._distribution_circles
+
+    def get_cached_keys_count(self):
+        # noinspection PyProtectedMember
+        return len(self._cache._cache)
+
+    def get_cache_space_usage(self):
+        return self._cache.space_usage
+
+    # === APIServer end
+
+    # === PublishServer begin
+
+    def update_nodes(self, nodes):
+        return self._nodes.update_nodes(nodes, self._create_node)
+
+    def get_other_nodes(self):
+        return self._nodes.nodes
+
+    # === PublishServer end

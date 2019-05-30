@@ -1,8 +1,15 @@
 #! /usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+When a node goes down keys may be lost, too.
+
+This script can be used to demonstrate this effect.
+
+Keys are lost, nice the distribution across redundancy levels is random. There
+is no guaranty that n copies of a key end up on n nodes.
+"""
 from argparse import ArgumentParser
 
-from dcache_client.api_client import DCache
+from dcache_client.zmq_client import Cache
 from uuid import uuid4
 from sys import stdin, stdout
 
@@ -14,7 +21,7 @@ def _set_keys(cache, count):
             key = str(uuid4())
             value = str(uuid4())
             error = cache.set(key, value)
-            if error != 0:
+            if error != Cache.Error.NO_ERROR:
                 print("E", end="")
                 stdout.flush()
             else:
@@ -30,8 +37,8 @@ def _check_keys(cache, keys):
     errors = 0
     try:
         for k, v in keys.items():
-            found, value = cache.get(k)
-            if not found or value != v:
+            value = cache.get(k)
+            if not value or value != v:
                 errors += 1
                 print("E", end="")
                 stdout.flush()
@@ -43,19 +50,26 @@ def _check_keys(cache, keys):
     return errors
 
 
+def _unset_keys(cache, keys):
+    for key in keys.keys():
+        cache.set(key, None)
+
+
 if __name__ == "__main__":
     parser = ArgumentParser(
-        description="Test if keys are lost when one node goes down.")
+        description="Test how many keys are lost when one node goes down.")
     parser.add_argument(
-        "url", help="The API url, something like http://localhost:9001/dcache")
+        "url", help="The API url, something like tcp://127.0.0.1:8001")
     parser.add_argument(
         "--count", type=int, default=1000, help="Count of keys to test.")
     args = parser.parse_args()
-    cache = DCache(args.url)
+    cache_client = Cache(args.url)
     print("Setting keys...")
-    keys = _set_keys(cache, args.count)
-    print("Disable one node, then press <enter>.")
+    keys_set = _set_keys(cache_client, args.count)
+    print("Disable one node, wait until it disappeared, then press <enter>.")
     stdin.readline()
     print("Checking keys...")
-    errors = _check_keys(cache, keys)
-    print("Encountered {} cache misses.".format(errors))
+    misses = _check_keys(cache_client, keys_set)
+    print(f"Encountered {misses} ({100 * misses / args.count}%)cache misses.")
+    print("Deleting keys...")
+    _unset_keys(cache_client, keys_set)

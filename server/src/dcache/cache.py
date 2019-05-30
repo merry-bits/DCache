@@ -1,113 +1,148 @@
-# -*- coding: utf-8 -*-
-from hashlib import md5
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from enum import unique
 from logging import getLogger
-from sys import byteorder
-
 
 _LOG = getLogger(__name__)
 
 
-def key_index(key):
-    """
-
-    :return: index of this key as a value between 0 and 1
-    """
-    m = md5()
-    m.update(key.encode("utf-8"))
-    return (
-        int.from_bytes(m.digest(), byteorder=byteorder, signed=False) /
-        pow(2, m.digest_size * 8))
-
-
-class Cache():
+class Cache:
     """The Cache for the node with a limited size and a last set first forget
     strategy.
 
     Each key has the following information stored:
     - time stamp of when the key was set
-    - list of nodes (ids) where the key should be stored
     - value of the key
     """
 
+    # Max amount of characters in the cache (len values of keys and values).
     MAX_SIZE = 1024 * 1024  # time stamps are ignored for measuring the size!
 
+    @unique
+    class Error(Enum):
+
+        NO_ERROR = "0"
+
+        TOO_BIG = "-1"
+
+    @dataclass
+    class _Entry:
+
+        value: str
+
+        last_update: datetime
+
+        hash_index: float
+
     def __init__(self):
-        #: :type self._cache: dict(str, (datetime.datetime, [long], str))
-        self._cache = {}
-        self._size = 0  # bytes
+        self._cache = {}  # key: _Entry
+        self._size = 0  # characters count
+
+    def __len__(self):
+        return len(self._cache)
+
+    def items(self):
+        return self._cache.items()
 
     @property
-    def key_indices(self):
-        return (
-            (k, ts, nodes, value, key_index(k))
-            for k, (ts, nodes, value) in self._cache.items())
+    def space_usage(self):
+        """How much of then available cache size is in use, in percentages.
 
-    def delete_key(self, key):
-        ts, _, value = self._cache.pop(key, (None, None, ""))
-        if ts is not None:  # key was in cache, reduce size
-            self._size -= len(key) + len(value)
+        :rtype: float
+        """
+        return 100 * self._size / self.MAX_SIZE
 
     def _removed_oldest_key(self, except_key):
         """Look for the key with the oldest time stamp and remove it.
+
+        :type except_key: str
         """
         oldest = None
         key_to_delete = None
-        for k, (t, _, _) in self._cache:
+        for k, entry in self._cache.items():
             if k != except_key:
-                if oldest is None or t < oldest:
-                    oldest = t
+                if oldest is None or entry.last_update < oldest:
+                    oldest = entry.last_update
                     key_to_delete = k
         if key_to_delete is not None:
-            self.delete_key(key_to_delete)
+            self._delete_key(key_to_delete)
 
-    def set(self, key, value, timestamp, nodes):
+    def _delete_key(self, key):
+        """Remove from cache and adjust size.
+
+        :type key: str
+        """
+        entry = self._cache.pop(key, None)
+        # Update size, if necessary.
+        if entry is not None:
+            self._size -= len(key) + len(entry.value)
+
+    def _set_entry(self, key, entry, size_change):
+        """Write one entry to the cache, make space first, if necessary.
+
+        :type key: value
+        :type entry: Cache._Entry
+        :type size_change: int
+        """
+        assert size_change <= self.MAX_SIZE
+        # Make space, if necessary.
+        while self._size + size_change > self.MAX_SIZE:
+            self._removed_oldest_key(key)
+        # Update entry and size count
+        self._cache[key] = entry
+        self._size += size_change
+        _LOG.debug("Did set key %s, usage: %f%%", key, self.space_usage)
+
+    def set(self, key, value, timestamp, hash_index):
         """Set the value for the key.
 
-        If the key does not fit in the available cache size, return an error.
-        If there is not enough space: delete old keys until there is.
+        If there is not enough space: delete oldest keys until there is.
+
+        :type key: str
+        :type value: str or None
+        :type timestamp: datetime.datetime
+        :type hash_index: float or None
+        :return:
+        :rtype: Cache.Error
         """
-        error = 0
-        if not value:  # delete
-            self.delete_key(key)
-        else:
-            # Calculate key and value size. Only key and value are considered.
-            current_size = 0
-            current_time_stamp = None
-            key_len = len(key)
-            size = key_len + len(value)
-            if size > self.MAX_SIZE:
-                error = -1  # to big
-            else:
-                # Is there an entry to update?
-                if key in self._cache:
-                    current_size += key_len
-                    current_time_stamp, _, current_value = self._cache[key]
-                    current_size += len(current_value)
-                # Not in cache or update needed?
-                # Update happens if the timestamps are the same, too.
-                if (current_time_stamp is None or
-                        current_time_stamp <= timestamp):
-                    size_diff = size - current_size
-                    while self._size + size_diff > self.MAX_SIZE:
-                        self._removed_oldest_key()
-                    self._cache[key] = (timestamp, nodes, value)
-                    self._size += size_diff
-            _LOG.debug(
-                "Did set key %s, usage: %f%%", key,
-                100 * self._size / self.MAX_SIZE)
-        return error
+        if not value:  # delete when None or empty!
+            self._delete_key(key)
+            return Cache.Error.NO_ERROR
+        # Check size.
+        key_len = len(key)
+        size = key_len + len(value or "")
+        if size > self.MAX_SIZE:
+            return Cache.Error.TOO_BIG
+        # Add or modify entry.
+        new_size = None  # nothing to do
+        entry = self._cache.get(key, None)
+        if entry is None:
+            # New entry needed.
+            new_size = size
+            # noinspection PyCallByClass
+            entry = Cache._Entry(value, timestamp, hash_index)
+        elif entry.last_update <= timestamp:
+            # Update existing entry.
+            current_size = key_len + len(entry.value)
+            new_size = size - current_size
+            entry.value = value  # technically changes cache size...
+            entry.last_update = timestamp
+        if new_size is not None:  # set entry necessary?
+            self._set_entry(key, entry, new_size)
+        return Cache.Error.NO_ERROR
 
     def get(self, key):
         """Return the value and when the key was set.
 
-        :rtype: (bool, datetime.datetime, str)
+        :rtype: (datetime.datetime, str)
         """
-        in_cache = False
-        timestamp = None
-        value = None
-        try:
-            timestamp, _, value = self._cache[key]
-            in_cache = True
-        except KeyError:
-            pass  # leaves in_cache to False
-        return (in_cache, timestamp, value)
+        entry = self._cache.get(key)
+        exists = entry is not None
+        last_update = entry.last_update if exists else None
+        value = entry.value if exists else None
+        return last_update, value
+
+    def index_for(self, key):
+        entry = self._cache.get(key)
+        return entry.hash_index if entry is not None else None

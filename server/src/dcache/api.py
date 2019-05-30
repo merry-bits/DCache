@@ -1,11 +1,13 @@
-# -*- coding: utf-8 -*-
 from uuid import uuid4
 
 from flask import current_app, request, jsonify
 from flask.app import Flask
+# noinspection PyPackageRequirements
 from werkzeug.exceptions import BadRequest, InternalServerError
+# noinspection PyUnresolvedReferences
 from zmq import PUSH, SUB, POLLIN  # @UnresolvedImport
 from zmq import Poller
+# noinspection PyUnresolvedReferences
 from zmq import SNDTIMEO, SUBSCRIBE  # @UnresolvedImport
 
 
