@@ -1,13 +1,18 @@
 # Distributed redundant cache
 
-A distributed cache written in Python using ZeroMQ. It allows to either set or
-get a key and its value. Both are strings. An empty value can not be stored.
-Storing an empty value deletes the entry instead.
+A distributed cache written in Python using ZeroMQ. It enables to either set or
+retrieve a value by key. Both value and key are strings. An empty value can not
+be stored. Storing an empty value deletes the entry instead.
 
 The cache consists of server nodes which communicate with each other and
-distribute the cache keys between them. When a node leaves the cache cluster not
-all keys from the leaving node are lost. Each node can answer any query and will
-forward a request to other nodes as necessary.
+distribute the cache entries between them. When a node leaves the cache cluster
+not all entries from the leaving node are lost. Each node can answer any query
+and will forward a request to other nodes as necessary.
+
+Stored or deleted values only become consistent eventually. The first node that
+answers a get request determines the value a key has for the request made. Where
+and on how many nodes an entry will be stored depends on the key and the number
+of nodes in the cluster (not mentioning the nodes configuration).
 
 
 ## Installation
@@ -20,7 +25,7 @@ folder run the following command to install the required python packages:
 
 Once the requirements are fulfilled the server and client scripts can be used.
 
-No setup or other package support exists at this time.
+No setup or package support exists at this time.
 
 
 ## Run
@@ -36,7 +41,7 @@ To change the cache size (measured in characters) change the `MAX_SIZE` value in
 ### Server node
 
 Run a node with:
-```
+```bash
     $ cd server/src
     $ ./run.py <REQUEST ADDRESS> <PUBLISH ADDRESS> <API ADDRESS>
 ```
@@ -52,10 +57,18 @@ socket address with the `--node` parameter pointing to the request socket of
 another running node.
 
 
+### Configuration must match!
+
+Each node can calculate where a key should be stored by the key, a nodes id and
+the replication and redundancy settings. If the number of replicas and the level
+of redundancy are not the same for all nodes in a cluster some nodes will
+mistakenly expect keys to be where they are not!
+
+
 ## Client
 
 Set or get a key with:
-```
+```bash
     $ cd client/src
     $ ./run.py
 ```
@@ -74,10 +87,10 @@ functions.
 ## Server detection
 
 Each server publishes all known servers regularly to all subscribers on the
-service URL. In turn the server registers to all other servers and merges their
-list with it's own. In this list each server has a last-seen date. If a node is
-not seen by at least one node within a certain amount of time each node starts
-to remove that node from the list.
+publish URL. In turn the server registers to all other servers and merges their
+list with its own. In this list each server has a last-seen date. If a node is
+not seen by at least one node within a defined amount of time each node starts
+to remove that node from their list.
 
 
 ### Publish protocol
@@ -130,6 +143,16 @@ unknown-request = "998"
 version-not-supported = "999"
 timestamp = YEAR : MONTH : DAY : HOUR : MINUTES : SECONDS ; UTC, Unix time
 ```
+
+
+#### To be added:
+
+The node to join should reuse the redundancy and replica values of the cluster
+and keep the own values until then at 1 only. Transmitting those values during
+the `connect-to-cluster` command should do the trick.
+
+This way a calculation for where a key should be store will always yield the
+exact same result, no matter which node makes the calculation.
 
 
 ### API protocol
